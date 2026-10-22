@@ -1,0 +1,606 @@
+name: PC criado pelo @alves7.pcm
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-11-arm
+    timeout-minutes: 360
+
+    steps:
+      # ==========================================
+      # 1. BAIXAR O REPOSITORIO
+      # ==========================================
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. INFORMACOES DO WINDOWS E HARDWARE
+      # ==========================================
+      - name: Show Windows and Hardware Information
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "=============================================="
+          Write-Host " PC criado pelo @alves7.pcm"
+          Write-Host " WINDOWS / HARDWARE / ARM64"
+          Write-Host "=============================================="
+
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+          $computer = Get-CimInstance Win32_ComputerSystem
+
+          $ramTotal = $computer.TotalPhysicalMemory / 1GB
+          $ramFree = $os.FreePhysicalMemory * 1KB / 1GB
+          $ramUsed = $ramTotal - $ramFree
+
+          Write-Host ""
+          Write-Host "=== SISTEMA OPERACIONAL ==="
+          Write-Host "Windows: $($os.Caption)"
+          Write-Host "Versao: $($os.Version)"
+          Write-Host "Build: $($os.BuildNumber)"
+          Write-Host "Arquitetura do SO: $($os.OSArchitecture)"
+          Write-Host "Ultimo boot: $($os.LastBootUpTime)"
+
+          Write-Host ""
+          Write-Host "=== MEMORIA RAM ==="
+          Write-Host ("RAM total: {0:N2} GB" -f $ramTotal)
+          Write-Host ("RAM livre: {0:N2} GB" -f $ramFree)
+          Write-Host ("RAM usada: {0:N2} GB" -f $ramUsed)
+
+          Write-Host ""
+          Write-Host "=== PROCESSADOR ==="
+          foreach ($item in $cpu) {
+            Write-Host "Modelo: $($item.Name)"
+            Write-Host "Nucleos: $($item.NumberOfCores)"
+            Write-Host "Processadores logicos: $($item.NumberOfLogicalProcessors)"
+            Write-Host "Arquitetura CIM: $($item.Architecture)"
+          }
+
+          Write-Host ""
+          Write-Host "=== DISCOS ==="
+          Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3" |
+            ForEach-Object {
+              Write-Host ("Unidade {0} - Total: {1:N2} GB - Livre: {2:N2} GB" -f `
+                $_.DeviceID,
+                ($_.Size / 1GB),
+                ($_.FreeSpace / 1GB))
+            }
+
+          Write-Host ""
+          Write-Host "=== ADAPTADORES DE REDE ==="
+          Get-NetAdapter -ErrorAction SilentlyContinue |
+            Format-Table Name, InterfaceDescription, Status, LinkSpeed -AutoSize
+
+          Write-Host ""
+          Write-Host "=== MEMORIA DOS PROCESSOS ==="
+          Get-Process -ErrorAction SilentlyContinue |
+            Sort-Object WorkingSet64 -Descending |
+            Select-Object -First 10 ProcessName,
+              @{Name="RAM_MB";Expression={[math]::Round($_.WorkingSet64 / 1MB, 1)}} |
+            Format-Table -AutoSize
+
+      # ==========================================
+      # 3. HABILITAR AREA DE TRABALHO REMOTA
+      # ==========================================
+      - name: Enable Remote Desktop
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Habilitando Remote Desktop..."
+
+          Set-ItemProperty `
+            -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Value 0
+
+          Enable-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue
+
+          # Garante a regra de firewall caso o grupo nao exista
+          if (!(Get-NetFirewallRule -DisplayName "RDP-3389" -ErrorAction SilentlyContinue)) {
+            New-NetFirewallRule `
+              -DisplayName "RDP-3389" `
+              -Direction Inbound `
+              -Protocol TCP `
+              -LocalPort 3389 `
+              -Action Allow `
+              -ErrorAction SilentlyContinue | Out-Null
+          }
+
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService -ErrorAction SilentlyContinue
+
+          Write-Host "Configuracao de RDP aplicada."
+
+      # ==========================================
+      # 4. CRIAR USUARIO ADMINISTRADOR
+      # ==========================================
+      - name: Create RDP User
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $username = "runneradmin"
+          $passwordText = "P@ssw0rd!"
+          $securePassword = ConvertTo-SecureString `
+            $passwordText -AsPlainText -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $existingUser) {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -Description "RDP Administrator" `
+              -PasswordNeverExpires
+          } else {
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -PasswordNeverExpires $true
+
+            Enable-LocalUser -Name $username
+          }
+
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "Usuario configurado: $username"
+          Write-Host "Grupos administrativos e RDP verificados."
+
+      # ==========================================
+      # 5. TESTAR ACESSO AO SERVIDOR TAILSCALE
+      # ==========================================
+      - name: Check Tailscale Network Connectivity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+
+          Write-Host "Verificando conectividade HTTPS..."
+
+          $targets = @(
+            "controlplane.tailscale.com",
+            "pkgs.tailscale.com"
+          )
+
+          foreach ($target in $targets) {
+            Write-Host ""
+            Write-Host "Destino: $target"
+
+            try {
+              $result = Test-NetConnection `
+                -ComputerName $target `
+                -Port 443 `
+                -WarningAction SilentlyContinue
+
+              Write-Host "Resolucao DNS: $($result.NameResolutionSucceeded)"
+              Write-Host "TCP 443: $($result.TcpTestSucceeded)"
+            } catch {
+              Write-Host "Falha no teste de rede: $($_.Exception.Message)"
+            }
+          }
+
+      # ==========================================
+      # 6. INSTALAR TAILSCALE PARA WINDOWS ARM64
+      # ==========================================
+      - name: Install Tailscale ARM64
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $ProgressPreference = "SilentlyContinue"
+
+          $installerPath = Join-Path $env:TEMP "tailscale-setup.exe"
+          $downloadUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-arm64.exe"
+          $fallbackUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+
+          Write-Host "Baixando o instalador oficial do Tailscale ARM64..."
+
+          try {
+            Invoke-WebRequest `
+              -Uri $downloadUrl `
+              -OutFile $installerPath `
+              -UseBasicParsing
+          } catch {
+            Write-Host "Falha no instalador ARM64, usando o instalador padrao..."
+            Invoke-WebRequest `
+              -Uri $fallbackUrl `
+              -OutFile $installerPath `
+              -UseBasicParsing
+          }
+
+          if (!(Test-Path $installerPath)) {
+            throw "O instalador do Tailscale nao foi encontrado."
+          }
+
+          $file = Get-Item $installerPath
+
+          if ($file.Length -lt 1MB) {
+            throw "O instalador baixado parece incompleto."
+          }
+
+          Write-Host "Instalador baixado: $($file.Length) bytes"
+
+          $process = Start-Process `
+            -FilePath $installerPath `
+            -ArgumentList @("/install", "/quiet", "/norestart") `
+            -Wait `
+            -PassThru
+
+          Write-Host "Codigo de saida do instalador: $($process.ExitCode)"
+
+          if ($process.ExitCode -ne 0) {
+            throw "O instalador do Tailscale retornou erro."
+          }
+
+          Start-Sleep -Seconds 8
+
+          $possiblePaths = @(
+            "C:\Program Files\Tailscale\tailscale.exe",
+            "C:\Program Files (x86)\Tailscale\tailscale.exe"
+          )
+
+          $tsExe = $null
+
+          foreach ($path in $possiblePaths) {
+            if (Test-Path $path) {
+              $tsExe = $path
+              break
+            }
+          }
+
+          if (!$tsExe) {
+            $found = Get-ChildItem `
+              -Path "C:\Program Files" `
+              -Filter "tailscale.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+            if ($found) {
+              $tsExe = $found.FullName
+            }
+          }
+
+          if (!$tsExe) {
+            throw "O executavel do Tailscale nao foi localizado."
+          }
+
+          "TAILSCALE_EXE=$tsExe" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host "Executavel encontrado: $tsExe"
+          & $tsExe version
+
+          $service = Get-Service `
+            -Name "Tailscale" `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $service) {
+            throw "O servico Tailscale nao foi criado."
+          }
+
+          Set-Service -Name "Tailscale" -StartupType Automatic
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name "Tailscale"
+          }
+
+          Start-Sleep -Seconds 5
+
+          Get-Service -Name "Tailscale" |
+            Format-Table Name, Status, StartType -AutoSize
+
+      # ==========================================
+      # 7. AUTENTICAR E VERIFICAR TAILSCALE
+      # ==========================================
+      - name: Authenticate and Verify Tailscale
+        shell: powershell
+        env:
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "=============================================="
+          Write-Host " AUTENTICACAO DO TAILSCALE"
+          Write-Host "=============================================="
+
+          if ([string]::IsNullOrWhiteSpace($env:TS_AUTH_KEY)) {
+            throw "Falta o segredo TAILSCALE_AUTH_KEY nas configuracoes do repositorio."
+          }
+
+          $tsExe = $env:TAILSCALE_EXE
+
+          if ([string]::IsNullOrWhiteSpace($tsExe) -or
+              !(Test-Path $tsExe)) {
+            throw "O executavel do Tailscale nao foi localizado."
+          }
+
+          $hostname = "enigmano-${{ github.run_id }}"
+
+          Write-Host "Verificando DNS e conexao TCP 443..."
+
+          $network = Test-NetConnection `
+            -ComputerName "controlplane.tailscale.com" `
+            -Port 443 `
+            -WarningAction SilentlyContinue
+
+          Write-Host "DNS: $($network.NameResolutionSucceeded)"
+          Write-Host "TCP 443: $($network.TcpTestSucceeded)"
+
+          if (!$network.TcpTestSucceeded) {
+            throw "Nao foi possivel acessar controlplane.tailscale.com pela porta 443."
+          }
+
+          Write-Host "Verificando o servico Tailscale..."
+
+          $service = Get-Service -Name "Tailscale"
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name "Tailscale"
+            Start-Sleep -Seconds 5
+          }
+
+          Write-Host "Executando autenticacao..."
+
+          # Nao mostrar a chave de autenticacao nos logs.
+          $upOutput = & $tsExe up `
+            "--auth-key=$env:TS_AUTH_KEY" `
+            "--hostname=$hostname" `
+            "--accept-dns=false" `
+            "--unattended" `
+            "--timeout=2m" 2>&1
+
+          $upExitCode = $LASTEXITCODE
+
+          # Mostra mensagens sem imprimir a chave secreta.
+          foreach ($entry in $upOutput) {
+            $line = "$entry"
+
+            if ($line -match "(?i)tskey-[A-Za-z0-9_-]+") {
+              Write-Host "[conteudo sensivel ocultado]"
+            } else {
+              Write-Host $line
+            }
+          }
+
+          if ($upExitCode -ne 0) {
+            throw "tailscale up terminou com codigo $upExitCode."
+          }
+
+          Write-Host "Comando de autenticacao finalizado."
+          Write-Host "Verificando estado e endereco IPv4..."
+
+          $connected = $false
+          $tailscaleIp = $null
+
+          for ($attempt = 1; $attempt -le 12; $attempt++) {
+            Write-Host ""
+            Write-Host "Verificacao $attempt de 12"
+
+            $statusOutput = & $tsExe status 2>&1
+            $statusCode = $LASTEXITCODE
+            $statusText = ($statusOutput | Out-String)
+
+            Write-Host "=== STATUS TAILSCALE ==="
+            Write-Host $statusText
+
+            $ipOutput = & $tsExe ip -4 2>&1
+            $ipCode = $LASTEXITCODE
+            $ipText = ($ipOutput | Out-String).Trim()
+
+            if ($ipCode -eq 0 -and
+                $ipText -match '(?m)\b100\.(?:\d{1,3}\.){2}\d{1,3}\b') {
+              $tailscaleIp = $Matches[0]
+              $connected = $true
+              break
+            }
+
+            if ($statusText -match "(?i)NeedsLogin|logged out|not logged in") {
+              Write-Host "O Tailscale indica que o login ainda nao foi concluido."
+            }
+
+            if ($statusText -match "(?i)NoState") {
+              Write-Host "O cliente continua no estado NoState."
+            }
+
+            Start-Sleep -Seconds 10
+          }
+
+          if (!$connected) {
+            Write-Host ""
+            Write-Host "=============================================="
+            Write-Host " DIAGNOSTICO FINAL DO TAILSCALE"
+            Write-Host "=============================================="
+
+            Write-Host "=== STATUS ==="
+            & $tsExe status 2>&1 |
+              ForEach-Object { Write-Host "$_" }
+
+            Write-Host "Codigo status: $LASTEXITCODE"
+
+            Write-Host ""
+            Write-Host "=== NETCHECK ==="
+            & $tsExe netcheck 2>&1 |
+              ForEach-Object { Write-Host "$_" }
+
+            Write-Host ""
+            Write-Host "=== SERVICO ==="
+            Get-Service -Name "Tailscale" |
+              Format-List Name, Status, StartType
+
+            Write-Host ""
+            Write-Host "=== CONECTIVIDADE HTTPS ==="
+            Test-NetConnection `
+              -ComputerName "controlplane.tailscale.com" `
+              -Port 443 `
+              -WarningAction SilentlyContinue |
+              Format-List ComputerName, RemotePort,
+                NameResolutionSucceeded, TcpTestSucceeded
+
+            $logDirectory = "C:\ProgramData\Tailscale\Logs"
+
+            if (Test-Path $logDirectory) {
+              Write-Host ""
+              Write-Host "=== LOGS RECENTES ==="
+
+              Get-ChildItem $logDirectory -File |
+                Sort-Object LastWriteTime -Descending |
+                Select-Object -First 2 |
+                ForEach-Object {
+                  Write-Host "Arquivo: $($_.Name)"
+                  Get-Content $_.FullName -Tail 35 `
+                    -ErrorAction SilentlyContinue
+                }
+            }
+
+            throw "Tailscale nao recebeu um endereco IPv4. Verifique o estado, os logs e a autenticacao."
+          }
+
+          Write-Host ""
+          Write-Host "=============================================="
+          Write-Host " TAILSCALE CONECTADO"
+          Write-Host " IPv4: $tailscaleIp"
+          Write-Host "=============================================="
+
+          "TAILSCALE_IPV4=$tailscaleIp" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ==========================================
+      # 8. INSTALAR GOOGLE CHROME
+      # ==========================================
+      - name: Install Google Chrome
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ProgressPreference = "SilentlyContinue"
+
+          $chromePaths = @(
+            "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+            "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe"
+          )
+
+          $chromeFound = $false
+
+          foreach ($path in $chromePaths) {
+            if ($path -and (Test-Path $path)) {
+              Write-Host "Chrome ja instalado: $path"
+              $chromeFound = $true
+              break
+            }
+          }
+
+          if (!$chromeFound) {
+            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+            if ($winget) {
+              & winget.exe install `
+                --id Google.Chrome `
+                --exact `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+
+              Write-Host "Codigo de saida do winget: $LASTEXITCODE"
+            } else {
+              Write-Host "winget nao esta disponivel. Baixando o Chrome ARM64..."
+
+              $msiPath = Join-Path $env:TEMP "chrome-arm64.msi"
+
+              try {
+                Invoke-WebRequest `
+                  -Uri "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi" `
+                  -OutFile $msiPath `
+                  -UseBasicParsing
+
+                $p = Start-Process msiexec.exe `
+                  -ArgumentList "/i `"$msiPath`" /qn /norestart" `
+                  -Wait `
+                  -PassThru
+
+                Write-Host "Codigo de saida do instalador do Chrome: $($p.ExitCode)"
+              } catch {
+                Write-Host "Nao foi possivel instalar o Chrome: $($_.Exception.Message)"
+              }
+            }
+          }
+
+      # ==========================================
+      # 9. INSTALAR 7-ZIP
+      # ==========================================
+      - name: Install 7-Zip
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $ProgressPreference = "SilentlyContinue"
+
+          $sevenZipPaths = @(
+            "$env:ProgramFiles\7-Zip\7z.exe",
+            "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+          )
+
+          $sevenZipFound = $false
+
+          foreach ($path in $sevenZipPaths) {
+            if ($path -and (Test-Path $path)) {
+              Write-Host "7-Zip ja instalado: $path"
+              $sevenZipFound = $true
+              break
+            }
+          }
+
+          if (!$sevenZipFound) {
+            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+
+            if ($winget) {
+              & winget.exe install `
+                --id 7zip.7zip `
+                --exact `
+                --silent `
+                --accept-package-agreements `
+                --accept-source-agreements `
+                --disable-interactivity
+
+              Write-Host "Codigo de saida do winget: $LASTEXITCODE"
+            } else {
+              Write-Host "winget nao esta disponivel. Baixando o 7-Zip ARM64..."
+
+              $exePath = Join-Path $env:TEMP "7z-arm64.exe"
+
+              try {
+                Invoke-WebRequest `
+                  -Uri "https://www.7-zip.org/a/7z2408-arm64.exe" `
+                  -OutFile $exePath `
+                  -UseBasicParsing
+
+                $p = Start-Process $exePath `
+                  -ArgumentList "/S" `
+                  -Wait `
+                  -PassThru
+
+                Write-Host "Codigo de saida do instalador do 7-Zip: $($p.ExitCode)"
+              } catch {
+                Write-Host "Nao foi possivel instalar o 7-Zip: $($_.Exception.Message)"
+              }
+            }
+          }
+
+      # ==========================================
+      # 10
